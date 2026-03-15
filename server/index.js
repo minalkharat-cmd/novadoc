@@ -4,7 +4,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { analyzeDocument, generateInsights, chatWithHistory } from "./nova.js";
+import { analyzeDocument, generateInsights, chatWithHistory, checkDrugInteractions, compareDocuments } from "./nova.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -34,7 +34,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowedTypes = ["image/png", "image/jpeg", "image/jpg", "image/webp", "application/pdf"];
     if (allowedTypes.includes(file.mimetype)) {
@@ -45,11 +45,22 @@ const upload = multer({
   },
 });
 
-// In-memory store for documents and chat history
-const patientData = {
-  documents: [],
-  chatHistory: [],
+// In-memory store — supports multiple family profiles
+const familyVault = {
+  activeProfile: "default",
+  profiles: {
+    default: {
+      name: "My Records",
+      avatar: "🧑",
+      documents: [],
+      chatHistory: [],
+    },
+  },
 };
+
+function getActiveProfile() {
+  return familyVault.profiles[familyVault.activeProfile];
+}
 
 // --- API ROUTES ---
 
@@ -60,6 +71,39 @@ app.get("/api/health", (req, res) => {
     mode: process.env.DEMO_MODE === "true" ? "demo" : "live",
     timestamp: new Date().toISOString(),
   });
+});
+
+// --- FAMILY PROFILES ---
+app.get("/api/profiles", (req, res) => {
+  const profiles = Object.entries(familyVault.profiles).map(([id, p]) => ({
+    id,
+    name: p.name,
+    avatar: p.avatar,
+    documentCount: p.documents.length,
+  }));
+  res.json({ activeProfile: familyVault.activeProfile, profiles });
+});
+
+app.post("/api/profiles", (req, res) => {
+  const { name, avatar } = req.body;
+  if (!name) return res.status(400).json({ error: "Name is required" });
+  const id = name.toLowerCase().replace(/\s+/g, "_") + "_" + Date.now();
+  familyVault.profiles[id] = {
+    name,
+    avatar: avatar || "👤",
+    documents: [],
+    chatHistory: [],
+  };
+  res.json({ success: true, id, profile: { name, avatar: avatar || "👤", documentCount: 0 } });
+});
+
+app.post("/api/profiles/switch", (req, res) => {
+  const { profileId } = req.body;
+  if (!familyVault.profiles[profileId]) {
+    return res.status(404).json({ error: "Profile not found" });
+  }
+  familyVault.activeProfile = profileId;
+  res.json({ success: true, activeProfile: profileId });
 });
 
 // Upload and analyze document
@@ -73,18 +117,20 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
     const fileBuffer = fs.readFileSync(filePath);
     const base64 = fileBuffer.toString("base64");
     const mimeType = req.file.mimetype;
+    const lang = req.body.lang || "en";
 
-    console.log(`[NovaDoc] Processing document: ${req.file.originalname} (${mimeType})`);
+    console.log(`[NovaDoc] Processing document: ${req.file.originalname} (${mimeType}) [${lang}]`);
 
-    // Step 1: Extract medical data using Nova Vision
     const extraction = await analyzeDocument(base64, mimeType);
     console.log(`[NovaDoc] Extraction complete: ${extraction.documentType}`);
 
-    // Step 2: Generate clinical insights
-    const insights = await generateInsights(extraction);
+    const insights = await generateInsights(extraction, lang);
     console.log(`[NovaDoc] Insights generated: ${insights.riskAlerts?.length || 0} alerts`);
 
-    // Store the document
+    // Check drug interactions
+    const drugInteractions = checkDrugInteractions(extraction.medications || []);
+    insights.drugInteractions = drugInteractions;
+
     const doc = {
       id: Date.now().toString(),
       filename: req.file.originalname,
@@ -93,11 +139,20 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
       extraction,
       insights,
     };
-    patientData.documents.push(doc);
+
+    const profile = getActiveProfile();
+    profile.documents.push(doc);
+
+    // Generate comparison if multiple docs exist
+    let comparison = null;
+    if (profile.documents.length >= 2) {
+      comparison = compareDocuments(profile.documents);
+    }
 
     res.json({
       success: true,
       document: doc,
+      comparison,
     });
   } catch (error) {
     console.error("[NovaDoc] Upload error:", error);
@@ -105,29 +160,53 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Get all documents
+// Get all documents for active profile
 app.get("/api/documents", (req, res) => {
-  res.json({ documents: patientData.documents });
+  const profile = getActiveProfile();
+  res.json({ documents: profile.documents });
+});
+
+// Drug interaction check endpoint
+app.post("/api/drug-interactions", (req, res) => {
+  const { medications } = req.body;
+  if (!medications || !Array.isArray(medications)) {
+    return res.status(400).json({ error: "medications array is required" });
+  }
+  const interactions = checkDrugInteractions(medications);
+  res.json({ interactions });
+});
+
+// Multi-document comparison
+app.get("/api/documents/compare", (req, res) => {
+  const profile = getActiveProfile();
+  if (profile.documents.length < 2) {
+    return res.json({ comparison: null, message: "Need at least 2 documents to compare" });
+  }
+  const comparison = compareDocuments(profile.documents);
+  res.json({ comparison });
 });
 
 // Chat with medical history
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, lang } = req.body;
     if (!message) {
       return res.status(400).json({ error: "Message is required" });
     }
 
-    const medicalContext = patientData.documents.map((d) => ({
+    const profile = getActiveProfile();
+
+    const medicalContext = profile.documents.map((d) => ({
       date: d.extraction.date,
       type: d.extraction.documentType,
       findings: d.extraction.findings,
+      medications: d.extraction.medications,
       summary: d.extraction.summary,
     }));
 
-    const response = await chatWithHistory(message, medicalContext, patientData.chatHistory);
+    const response = await chatWithHistory(message, medicalContext, profile.chatHistory, lang || "en");
 
-    patientData.chatHistory.push(
+    profile.chatHistory.push(
       { role: "user", content: message },
       { role: "assistant", content: response }
     );
@@ -139,14 +218,15 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// Clear all data
+// Clear all data for active profile
 app.post("/api/reset", (req, res) => {
-  patientData.documents = [];
-  patientData.chatHistory = [];
+  const profile = getActiveProfile();
+  profile.documents = [];
+  profile.chatHistory = [];
   res.json({ success: true });
 });
 
-// Global error handler — catches multer errors and all unhandled errors
+// Global error handler
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
